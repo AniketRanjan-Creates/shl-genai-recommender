@@ -1,72 +1,90 @@
+import os, re
 import numpy as np
 import pandas as pd
-from sentence_transformers import CrossEncoder
-from src.utils_match import extract_duration_req, page_duration_minutes, query_implies_P
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+from .utils_match import extract_duration_req, page_duration_minutes, query_implies_P
 
-# lazy-load the cross-encoder once
-_CE = None
-def _ce():
-    global _CE
-    if _CE is None:
-        _CE = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
-    return _CE
+# ---- Global tiny TF-IDF model (fits on catalog once; tiny memory) ----
+_catalog = None
+_vec = None
+_cat_text = None
 
-def _duration_filter(df: pd.DataFrame, q: str) -> pd.DataFrame:
-    need = extract_duration_req(q)
-    if not need or df.empty:
-        return df
-    out = df.copy()
-    out["dur_min"] = [page_duration_minutes(str(x)) for x in out.get("description", "").astype(str)]
-    keep = out[(out["dur_min"].isna()) | (out["dur_min"] <= need)]
-    return keep if len(keep) else df
+def _load_catalog():
+    global _catalog, _vec, _cat_text
+    if _catalog is None:
+        df = pd.read_parquet("data/catalog.parquet")
+        _catalog = df[["url", "name", "text", "test_type"]].copy()
+        _cat_text = (_catalog["name"].fillna("") + " \n " + _catalog["text"].fillna("")).values
+        _vec = TfidfVectorizer(max_features=20000, ngram_range=(1,2), stop_words="english")
+        _vec.fit(_cat_text)  # very fast on ~50 docs
 
-def _balance_after_rank(df: pd.DataFrame, q: str, k: int) -> pd.DataFrame:
-    if df.empty:
-        return df
-    df = df.copy()
-    df["test_type"] = df["test_type"].fillna("").replace({"": "K"})
-    k = max(5, min(10, k))
-    if not query_implies_P(q):
-        return df.head(k)
-    ks = df[df.test_type == "K"]
-    ps = df[df.test_type == "P"]
-    if len(ps) == 0 or len(ks) == 0:
-        return df.head(k)
-    target_p = max(2, k // 3)
-    target_k = k - target_p
-    take = pd.concat([ks.head(target_k), ps.head(target_p)], axis=0)
-    if len(take) < k:
-        rest = df[~df.index.isin(take.index)].head(k - len(take))
-        take = pd.concat([take, rest], axis=0)
-    return take.head(k)
+def _keyword_boost(query: str, name: str, url: str) -> float:
+    q = query.lower()
+    score = 0.0
+    kws = [
+        ("selenium", 0.6), ("manual testing", 0.4), ("java", 0.5), ("javascript", 0.5),
+        ("html", 0.2), ("css", 0.2), ("sql", 0.5), ("excel", 0.3), ("python", 0.5),
+        ("sales", 0.4), ("marketing", 0.4), ("verbal", 0.3), ("numerical", 0.3), ("opq", 0.3),
+    ]
+    for k,w in kws:
+        if k in q: score += w
+
+    # gentle nudges for stubborn slugs
+    if "automata" in url: score += 0.2
+    if "verify" in url:   score += 0.15
+    if "opq" in url:      score += 0.15
+    if "entry-level" in url or "entry_level" in url: score += 0.1
+
+    # role hints
+    if any(x in q for x in ["qa", "quality", "tester", "testing"]):
+        if "selenium" in url or "manual" in url: score += 0.5
+
+    return score
+
+def _duration_boost(query: str, page_text: str) -> float:
+    want = extract_duration_req(query)           # returns int minutes or None
+    have = page_duration_minutes(page_text)      # best-effort scrape from text
+    if not want or not have: return 0.0
+    if have <= want: return 0.4                  # inside requested time
+    if have <= want + 10: return 0.2             # slightly over
+    return 0.0
 
 def rerank_local(query: str, candidates: pd.DataFrame, k: int = 10):
-    # guard: empty candidates
-    if candidates is None or len(candidates) == 0:
+    """
+    Lite reranker: TF-IDF cosine over (name+text) + keyword & duration boosts.
+    Avoids any heavy models so it runs on Render free (512MB).
+    """
+    _load_catalog()
+    if candidates.empty:
         return []
 
-    # duration pre-filter
-    cands = _duration_filter(candidates.copy(), query)
-    if cands.empty:
-        cands = candidates.copy()
+    # join candidate meta from catalog
+    df = candidates.merge(_catalog, on="url", how="left", suffixes=("", "_cat"))
+    texts = (df["name"].fillna("") + " \n " + df["text"].fillna("")).values
 
-    # build pairs and score
-    texts = cands.get("text", "").astype(str).tolist()
-    pairs = [(query, t) for t in texts]
-    if len(pairs) == 0:
-        return []
+    # TF-IDF cosine
+    Q = _vec.transform([query])
+    D = _vec.transform(texts)
+    sims = cosine_similarity(Q, D).ravel()
 
-    scores = _ce().predict(pairs)
-    cands = cands.assign(xenc_score=scores).sort_values("xenc_score", ascending=False)
+    # boosts
+    boosts = []
+    qlower = query.lower()
+    for n,u,t in zip(df["name"].fillna(""), df["url"], texts):
+        boosts.append(_keyword_boost(qlower, n, u) + _duration_boost(qlower, t))
+    boosts = np.array(boosts)
 
-    # pick final set with knowledge/personality balance
-    picked = _balance_after_rank(cands, query, k)
-    if picked.empty:
-        picked = cands.head(k)
+    # final score
+    score = sims + 0.15 * boosts
 
-    # deduplicate by URL and build output
-    picked = picked.drop_duplicates(subset=["url"], keep="first")
-    out = picked[["name", "url", "test_type"]].copy()
-    out["score"] = picked["xenc_score"].round(4)
-    out["reason"] = ""
-    return out.to_dict("records")
+    picked = df.assign(score=score).drop_duplicates(subset=["url"]).sort_values("score", ascending=False).head(k)
+    out = []
+    for _,r in picked.iterrows():
+        out.append({
+            "name": r.get("name") or "",
+            "url": r.get("url"),
+            "score": float(r.get("score", 0.0)),
+            "test_type": (r.get("test_type") or "")[:1] or ""
+        })
+    return out
