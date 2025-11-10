@@ -3,6 +3,12 @@ services:
     name: shl-recommender-api
     env: python
     plan: free
-    buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn src.api:app --host 0.0.0.0 --port $PORT
+    buildCommand: pip install -r requirements-api.txt
+    startCommand: sh -c 'gunicorn -k uvicorn.workers.UvicornWorker -w 1 -b 0.0.0.0:$PORT src.api:app'
     healthCheckPath: /health
+    envVars:
+      - key: LITE_RERANK
+        value: "1"
+      - key: PYTHONUNBUFFERED
+        value: "1"
+
