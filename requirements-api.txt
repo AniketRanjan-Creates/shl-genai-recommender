@@ -6,5 +6,4 @@ numpy
 faiss-cpu
 scikit-learn
 python-dotenv
-gunicorn  
 sentence-transformers
