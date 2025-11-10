@@ -1,9 +1,11 @@
-fastapi
-uvicorn
+streamlit==1.39.0
 pandas
-pyarrow
 numpy
 faiss-cpu
 scikit-learn
-python-dotenv
 sentence-transformers
+torch
+fastapi
+uvicorn
+python-dotenv
+joblib
