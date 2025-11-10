@@ -6,3 +6,4 @@ numpy
 faiss-cpu
 scikit-learn
 python-dotenv
+gunicorn  
