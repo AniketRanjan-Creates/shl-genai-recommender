@@ -1,6 +1,10 @@
 # SHL Assessment Recommender (Generative AI Assignment)
 
+
 A retrieval + reranking system that recommends SHL assessments based on hiring queries or job descriptions.
+
+LIVE DEMO - https://shl-genai-recommender-cukdktfmyvms9bnvn2mhz4.streamlit.app/
+
 
 ## 🧠 Overview
 
@@ -22,3 +26,5 @@ cd shl_rec
 python -m venv .venv
 .venv\Scripts\activate
 pip install -r requirements.txt
+
+L
